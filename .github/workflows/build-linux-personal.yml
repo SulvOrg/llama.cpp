@@ -1,0 +1,144 @@
+name: Build Linux personal
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: 'CUDA toolkit version (must stay 12.x for GTX 1050 Ti)'
+        required: false
+        default: '12.9.1'
+        type: string
+
+permissions:
+  contents: read
+
+# Manual builds for Linux x64.
+# - linux-cpu: runs anywhere, no GPU needed
+# - linux-cuda-legacy: built with CUDA 12.x so Pascal (GTX 1050 Ti, CC 6.1) works.
+#   CUDA 13 dropped offline compile for CC < 7.5, so do not move this job to 13.x.
+# Binaries are built on ubuntu-24.04 (glibc 2.39) so they run on Debian 13
+# (glibc 2.41). Newer glibc runs binaries built on older glibc.
+# Download results from the Actions run page (Artifacts section).
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev gcc-14 g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build -j $(nproc)
+
+      - name: Smoke test
+        run: |
+          ./build/bin/llama-cli --version
+          ./build/bin/llama-server --version
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-bin-linux-cpu-x64.tar.gz -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-linux-cpu-x64
+          path: llama-bin-linux-cpu-x64.tar.gz
+          archive: false
+
+  linux-cuda-legacy:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu24.04
+
+    steps:
+      # container has no git, install it first so checkout creates a real repo
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Clone
+        uses: actions/checkout@v6
+
+      # checkout runs as host user, container steps run as root
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev
+
+      - name: Check nvcc
+        run: nvcc --version
+
+      - name: Build
+        # no CMAKE_CUDA_ARCHITECTURES: use ggml default arch set.
+        # On CUDA 12 it includes 50/61/70 as PTX plus newer real archs,
+        # so GTX 1050 Ti (CC 6.1) is covered. Do not build this job with CUDA 13.
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build -j $(nproc)
+
+      - name: Smoke test
+        run: |
+          ./build/bin/llama-cli --version
+          ./build/bin/llama-server --version
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-bin-linux-cuda-12-x64.tar.gz -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-linux-cuda-12-x64
+          path: llama-bin-linux-cuda-12-x64.tar.gz
+          archive: false
+
+      # ship the CUDA runtime libs the backend links against, extract next to binaries
+      - name: Pack CUDA runtime
+        run: |
+          mkdir -p ./cudart
+          cp -L /usr/local/cuda/lib64/libcudart.so.12 ./cudart/
+          cp -L /usr/local/cuda/lib64/libcublas.so.12 ./cudart/
+          cp -L /usr/local/cuda/lib64/libcublasLt.so.12 ./cudart/
+          tar -czvf cudart-linux-cuda-12-x64.tar.gz -C ./cudart .
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: cudart-linux-cuda-12-x64
+          path: cudart-linux-cuda-12-x64.tar.gz
+          archive: false
